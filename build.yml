@@ -49,6 +49,7 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           root = Path('/Users/Shared/telegram-ios')
           app_group = 'group.a69e6dc9a612eb7d.1'
@@ -77,21 +78,26 @@ jobs:
 
           build = root / 'Telegram/BUILD'
           text = build.read_text(encoding='utf-8')
-          old = '''        "//conditions:default": [
-              ":ShareExtension",
-              ":NotificationContentExtension",
-              ":NotificationServiceExtension" + notificationServiceExtensionVersion,
-              ":IntentsExtension",
-              ":WidgetExtension",
-              ":BroadcastUploadExtension",
-          ],'''
-          new = '''        "//conditions:default": [
-              ":NotificationServiceExtension" + notificationServiceExtensionVersion,
-          ],'''
-          count = text.count(old)
+
+          # Keep only NotificationService in the app's extension list.
+          # Match structurally instead of depending on exact whitespace.
+          pattern = re.compile(
+              r'(extensions\s*=\s*select\(\{\s*'
+              r'"?:disableExtensionsSetting"?\s*:\s*\[\]\s*,\s*'
+              r'"//conditions:default"\s*:\s*)\['
+              r'.*?'
+              r'\](\s*,\s*\}\)\s*,)',
+              re.S,
+          )
+          replacement = (
+              r'\1[\n'
+              r'            ":NotificationServiceExtension" + notificationServiceExtensionVersion,\n'
+              r'        ]\2'
+          )
+          text2, count = pattern.subn(replacement, text, count=1)
           if count != 1:
-              raise SystemExit(f'extension list pattern mismatch: {count}')
-          build.write_text(text.replace(old, new), encoding='utf-8')
+              raise SystemExit(f'extension list structural pattern mismatch: {count}')
+          build.write_text(text2, encoding='utf-8')
           print('source patch complete')
           PY
 
@@ -205,4 +211,3 @@ jobs:
             ${{ runner.temp }}/SHA256.txt
           if-no-files-found: error
           retention-days: 7
-
