@@ -18,9 +18,20 @@ jobs:
         run: |
           set -euxo pipefail
           sudo rm -rf /Users/Shared/telegram-ios
-          git clone --recursive --branch v1.0.15 https://github.com/yar2slav/Madgram-iOS.git /Users/Shared/telegram-ios
+          git clone --branch v1.0.15 https://github.com/yar2slav/Madgram-iOS.git /Users/Shared/telegram-ios
           cd /Users/Shared/telegram-ios
           test "$(git rev-parse HEAD)" = "39fc4cc292696e8d25dec9b9c6a3712b68a72d0e"
+
+          # MadGram's tag points these two submodules at yar2slav forks that are
+          # no longer anonymously cloneable. The exact gitlink commits also
+          # exist in the public upstream repositories, so keep the revisions
+          # identical and only replace their fetch URLs.
+          git config submodule.submodules/TgVoipWebrtc/tgcalls.url https://github.com/TelegramMessenger/tgcalls.git
+          git config submodule.submodules/rlottie/rlottie.url https://github.com/Samsung/rlottie.git
+          git submodule update --init --recursive
+
+          test "$(git -C submodules/TgVoipWebrtc/tgcalls rev-parse HEAD)" = "e3069322a3d1e16ecb11a5e302242e59ddd7f09e"
+          test "$(git -C submodules/rlottie/rlottie rev-parse HEAD)" = "67f103bc8b625f2a4a9e94f1d8c7bd84c5a08d1d"
 
       - name: Select repository Xcode version
         run: |
@@ -194,3 +205,4 @@ jobs:
             ${{ runner.temp }}/SHA256.txt
           if-no-files-found: error
           retention-days: 7
+
