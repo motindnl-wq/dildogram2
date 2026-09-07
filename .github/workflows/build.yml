@@ -1,267 +1,590 @@
-name: Build MadGram Push Source
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-
+name: Build MadGram 1.0.15 clean source with NSE
 permissions:
   contents: read
-
 jobs:
   build:
     runs-on: macos-26
     timeout-minutes: 150
-
     steps:
-      - name: Clone exact MadGram 1.0.15 source
-        run: |
-          set -euxo pipefail
-          sudo rm -rf /Users/Shared/telegram-ios
-          git clone --branch v1.0.15 https://github.com/yar2slav/Madgram-iOS.git /Users/Shared/telegram-ios
-          cd /Users/Shared/telegram-ios
-          test "$(git rev-parse HEAD)" = "39fc4cc292696e8d25dec9b9c6a3712b68a72d0e"
+    - name: Clone exact MadGram 1.0.15 source
+      run: |
+        set -euxo pipefail
+        git clone --branch v1.0.15 https://github.com/yar2slav/Madgram-iOS.git /Users/Shared/telegram-ios
+        cd /Users/Shared/telegram-ios
+        test "$(git rev-parse HEAD)" = "39fc4cc292696e8d25dec9b9c6a3712b68a72d0e"
 
-          # MadGram's tag points these two submodules at yar2slav forks that are
-          # no longer anonymously cloneable. The exact gitlink commits also
-          # exist in the public upstream repositories, so keep the revisions
-          # identical and only replace their fetch URLs.
-          git config submodule.submodules/TgVoipWebrtc/tgcalls.url https://github.com/TelegramMessenger/tgcalls.git
-          git config submodule.submodules/rlottie/rlottie.url https://github.com/Samsung/rlottie.git
-          git submodule update --init --recursive
+        # MadGram's tag points these two submodules at yar2slav forks that are
+        # no longer anonymously cloneable. The exact gitlink commits also
+        # exist in the public upstream repositories, so keep the revisions
+        # identical and only replace their fetch URLs.
+        git config submodule.submodules/TgVoipWebrtc/tgcalls.url https://github.com/TelegramMessenger/tgcalls.git
+        git config submodule.submodules/rlottie/rlottie.url https://github.com/Samsung/rlottie.git
+        git submodule update --init --recursive
 
-          test "$(git -C submodules/TgVoipWebrtc/tgcalls rev-parse HEAD)" = "e3069322a3d1e16ecb11a5e302242e59ddd7f09e"
-          test "$(git -C submodules/rlottie/rlottie rev-parse HEAD)" = "67f103bc8b625f2a4a9e94f1d8c7bd84c5a08d1d"
+        test "$(git -C submodules/TgVoipWebrtc/tgcalls rev-parse HEAD)" = "e3069322a3d1e16ecb11a5e302242e59ddd7f09e"
+        test "$(git -C submodules/rlottie/rlottie rev-parse HEAD)" = "67f103bc8b625f2a4a9e94f1d8c7bd84c5a08d1d"
+    - name: Select repository Xcode version
+      run: |
+        set -euxo pipefail
+        XCODE_VERSION="$(python3 - <<'PY'
+        import json
+        print(json.load(open('/Users/Shared/telegram-ios/versions.json'))['xcode'])
+        PY
+        )"
+        echo "MadGram requests Xcode $XCODE_VERSION"
+        sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+        xcodebuild -version
+    - name: Configure a fresh source build with only NSE and no CloudKit
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        import json
+        import re
 
-      - name: Select repository Xcode version
-        run: |
-          set -euxo pipefail
-          XCODE_VERSION="$(python3 - <<'PY'
-          import json
-          print(json.load(open('/Users/Shared/telegram-ios/versions.json'))['xcode'])
-          PY
-          )"
-          echo "MadGram requests Xcode $XCODE_VERSION"
-          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          xcodebuild -version
+        root = Path('/Users/Shared/telegram-ios')
+        app_group = 'group.a69e6dc9a612eb7d.1'
 
-      - name: Apply source-level push patch
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
+        # This signing profile has no CloudKit container. Match the published
+        # MadGram 1.0.15 release: never call CKContainer.default at startup.
+        # Follow the author's minimal development template. Use only the dummy
+        # CI bundle/team identity from the upstream App Store configuration.
+        # The final artifact will be fully re-signed on the user's device.
+        config_path = root / 'build-system/local-development-configuration.json'
+        config = json.loads((root / 'build-system/template_minimal_development_configuration.json').read_text())
+        ci_identity = json.loads((root / 'build-system/appstore-configuration.json').read_text())
+        config['bundle_id'] = ci_identity['bundle_id']
+        config['team_id'] = ci_identity['team_id']
+        # Restore the public release's existing client configuration. Do not
+        # ship the upstream sample API ID 8 from appstore-configuration.json.
+        import hashlib
+        import io
+        import struct
+        import urllib.request
+        import zipfile
 
-          root = Path('/Users/Shared/telegram-ios')
-          app_group = 'group.a69e6dc9a612eb7d.1'
+        release_url = 'https://github.com/yar2slav/Madgram-iOS/releases/download/v1.0.15/MadGram-1.0.15.ipa'
+        expected_sha = 'd503a51b83ef27a6b7928ca67276a8008eef3370f14f974e5e12c18afc6c5829'
+        with urllib.request.urlopen(release_url, timeout=120) as response:
+            release = response.read()
+        if hashlib.sha256(release).hexdigest() != expected_sha:
+            raise SystemExit('Reference release digest mismatch')
+        with zipfile.ZipFile(io.BytesIO(release)) as archive:
+            image = archive.read('Payload/Telegram.app/Frameworks/TelegramUIFramework.framework/TelegramUIFramework')
+        if image[:4] != bytes.fromhex('cffaedfe'):
+            raise SystemExit('Reference is not the expected arm64 Mach-O')
+        segments = []
+        pos = 32
+        for _ in range(struct.unpack_from('<I', image, 16)[0]):
+            command, length = struct.unpack_from('<II', image, pos)
+            if command == 0x19:
+                vm, vm_size, file_offset, file_size = struct.unpack_from('<4Q', image, pos + 24)
+                segments.append((vm, file_offset, file_size))
+            pos += length
+        def offset(address):
+            for vm, file_offset, file_size in segments:
+                if vm <= address < vm + file_size:
+                    return file_offset + address - vm
+            raise SystemExit('Reference address is not file-backed')
+        low, high = struct.unpack_from('<II', image, offset(0x312f850))
+        if low & 0xffe0001f != 0x52800008 or high & 0xffe0001f != 0x72a00008:
+            raise SystemExit('Reference API initializer mismatch')
+        api_id = ((low >> 5) & 65535) | (((high >> 5) & 65535) << 16)
+        hash_pointer, hash_length = struct.unpack_from('<QQ', image, offset(0x50f61d8) + 16)
+        api_hash = image[offset(hash_pointer):offset(hash_pointer) + hash_length]
+        if api_id != 31349372 or len(api_hash) != 32 or any(c not in b'0123456789abcdef' for c in api_hash):
+            raise SystemExit('Reference API configuration is invalid')
+        if hashlib.sha256(api_hash).hexdigest() != 'd17839d0c28e1921d5f38825b1c3e046ce7d1a7b8e5340e1d3e0e9df8bfdc77e':
+            raise SystemExit('Reference API hash mismatch')
+        config['api_id'] = str(api_id)
+        config['api_hash'] = api_hash.decode('ascii')
+        config['is_appstore_build'] = 'false'
+        config['appstore_id'] = '0'
+        config['is_internal_build'] = 'false'
+        config['enable_icloud'] = False
+        config['enable_siri'] = False
+        if any('{!' in str(value) for value in config.values()):
+            raise SystemExit('Unresolved configuration placeholder')
+        config_path.write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
+        # GitHub masks this value if a compiler command accidentally logs it.
+        import os
+        if os.environ.get('GITHUB_ACTIONS') == 'true':
+            print('::add-mask::' + config['api_hash'])
+        print('Original release API configuration restored; CloudKit disabled')
 
-          def replace_exact(path, old, new, expected):
-              p = root / path
-              text = p.read_text(encoding='utf-8')
-              count = text.count(old)
-              if count != expected:
-                  raise SystemExit(f'{p}: expected {expected}, found {count} for {old!r}')
-              p.write_text(text.replace(old, new), encoding='utf-8')
-              print('patched', p, count)
+        def replace_exact(path, old, new, expected):
+            p = root / path
+            text = p.read_text(encoding='utf-8')
+            count = text.count(old)
+            if count != expected:
+                raise SystemExit(f'{p}: expected {expected}, found {count} for {old!r}')
+            p.write_text(text.replace(old, new), encoding='utf-8')
+            print('patched', p, count)
 
-          replace_exact(
-              'submodules/TelegramUI/Sources/AppDelegate.swift',
-              'let appGroupName = "group.\\(baseAppBundleId)"',
-              f'let appGroupName = "{app_group}"',
-              2,
-          )
-          replace_exact(
-              'Telegram/NotificationService/Sources/NotificationService.swift',
-              'let appGroupName = "group.\\(baseAppBundleId)"',
-              f'let appGroupName = "{app_group}"',
-              1,
-          )
+        replace_exact(
+            'submodules/TelegramUI/Sources/AppDelegate.swift',
+            'let appGroupName = "group.\\(baseAppBundleId)"',
+            f'let appGroupName = "{app_group}"',
+            2,
+        )
+        replace_exact(
+            'Telegram/NotificationService/Sources/NotificationService.swift',
+            'let appGroupName = "group.\\(baseAppBundleId)"',
+            f'let appGroupName = "{app_group}"',
+            1,
+        )
 
-          # Only the background URLSession declaration became unused. The
-          # launch path still needs baseAppBundleId for BuildConfig and keychain.
-          replace_exact(
-              'submodules/TelegramUI/Sources/AppDelegate.swift',
-              '        let baseAppBundleId = Bundle.main.bundleIdentifier!\n'
-              f'        let appGroupName = "{app_group}"\n\n'
-              '        let configuration = URLSessionConfiguration.background(withIdentifier: identifier)',
-              f'        let appGroupName = "{app_group}"\n\n'
-              '        let configuration = URLSessionConfiguration.background(withIdentifier: identifier)',
-              1,
-          )
+        # Only the background URLSession declaration became unused. The
+        # launch path still needs baseAppBundleId for BuildConfig and keychain.
+        replace_exact(
+            'submodules/TelegramUI/Sources/AppDelegate.swift',
+            '        let baseAppBundleId = Bundle.main.bundleIdentifier!\n'
+            f'        let appGroupName = "{app_group}"\n\n'
+            '        let configuration = URLSessionConfiguration.background(withIdentifier: identifier)',
+            f'        let appGroupName = "{app_group}"\n\n'
+            '        let configuration = URLSessionConfiguration.background(withIdentifier: identifier)',
+            1,
+        )
 
-          build = root / 'Telegram/BUILD'
-          text = build.read_text(encoding='utf-8')
+        build = root / 'Telegram/BUILD'
+        text = build.read_text(encoding='utf-8')
 
-          # Keep only NotificationService in the app's extension list.
-          # Match structurally instead of depending on exact whitespace.
-          pattern = re.compile(
-              r'(extensions\s*=\s*select\(\{\s*'
-              r'"?:disableExtensionsSetting"?\s*:\s*\[\]\s*,\s*'
-              r'"//conditions:default"\s*:\s*)\['
-              r'.*?'
-              r'\](\s*,\s*\}\)\s*,)',
-              re.S,
-          )
-          replacement = (
-              r'\1[\n'
-              r'            ":NotificationServiceExtension" + notificationServiceExtensionVersion,\n'
-              r'        ]\2'
-          )
-          text2, count = pattern.subn(replacement, text, count=1)
-          if count != 1:
-              raise SystemExit(f'extension list structural pattern mismatch: {count}')
-          build.write_text(text2, encoding='utf-8')
-          print('source patch complete')
-          PY
+        # Keep only NotificationService in the app's extension list.
+        # Match structurally instead of depending on exact whitespace.
+        pattern = re.compile(
+            r'(extensions\s*=\s*select\(\{\s*'
+            r'"?:disableExtensionsSetting"?\s*:\s*\[\]\s*,\s*'
+            r'"//conditions:default"\s*:\s*)\['
+            r'.*?'
+            r'\](\s*,\s*\}\)\s*,)',
+            re.S,
+        )
+        replacement = (
+            r'\1[\n'
+            r'            ":NotificationServiceExtension" + notificationServiceExtensionVersion,\n'
+            r'        ]\2'
+        )
+        text2, count = pattern.subn(replacement, text, count=1)
+        if count != 1:
+            raise SystemExit(f'extension list structural pattern mismatch: {count}')
+        build.write_text(text2, encoding='utf-8')
+        # Keep the source changes and non-secret provenance beside the build log.
+        import subprocess
+        out = Path(os.environ['RUNNER_TEMP'])
+        changed_paths = [
+            'Telegram/BUILD',
+            'submodules/TelegramUI/Sources/AppDelegate.swift',
+            'Telegram/NotificationService/Sources/NotificationService.swift',
+        ]
+        source_diff = subprocess.check_output(['git', 'diff', '--', *changed_paths], cwd=root)
+        (out / 'MadGram-source-changes.patch').write_bytes(source_diff)
+        provenance = {
+            'source_repository': 'https://github.com/yar2slav/Madgram-iOS',
+            'source_commit': '39fc4cc292696e8d25dec9b9c6a3712b68a72d0e',
+            'source_tag': 'v1.0.15',
+            'source_changes_sha256': hashlib.sha256(source_diff).hexdigest(),
+            'reference_release_sha256': expected_sha,
+            'api_id': api_id,
+            'api_hash_sha256': hashlib.sha256(api_hash).hexdigest(),
+            'cloudkit_enabled': False,
+            'is_appstore_build': False,
+            'appstore_id': 0,
+            'app_group': app_group,
+            'aps_environment_requested': 'production',
+            'extensions': ['NotificationService'],
+            'build_number': '29',
+            'xcode': json.loads((root / 'versions.json').read_text())['xcode'],
+        }
+        (out / 'MadGram-source-provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
+        print('Source configuration complete; NSE enabled, CloudKit disabled')
+        PY
+    - name: Import MadGram fake CI certificate
+      working-directory: /Users/Shared/telegram-ios
+      run: |
+        set -euxo pipefail
+        python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+    - name: Build arm64 device IPA with real NotificationService.appex
+      id: madgram_build
+      continue-on-error: true
+      working-directory: /Users/Shared/telegram-ios
+      run: |
+        set -uo pipefail
+        LOG="$GITHUB_WORKSPACE/MadGram-build.log"
+        : > "$LOG"
 
-      - name: Import MadGram fake CI certificate
-        working-directory: /Users/Shared/telegram-ios
-        run: |
-          set -euxo pipefail
-          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+        set +e
+        python3 -u build-system/Make/Make.py \
+          --bazelUserRoot=/private/var/tmp/_bazel_containerhost \
+          --bazelArguments='--//Telegram:disableExtensions=false' \
+          build \
+          --configurationPath=build-system/local-development-configuration.json \
+          --codesigningInformationPath=build-system/fake-codesigning \
+          --configuration=release_arm64 \
+          --buildNumber=29 \
+            --apsEnvironment=production \
+          2>&1 | tee "$LOG"
+        STATUS=${PIPESTATUS[0]}
+        set -e
 
-      - name: Build arm64 device IPA with real NotificationService.appex
-        id: madgram_build
-        continue-on-error: true
-        working-directory: /Users/Shared/telegram-ios
-        run: |
-          set -uo pipefail
-          LOG="$GITHUB_WORKSPACE/MadGram-build.log"
-          : > "$LOG"
+        echo ""
+        echo "Build errors"
+        grep -iE '(^|[[:space:]])(error:|ERROR|FAILED|FAILURE|Traceback|Exception|fatal:)' "$LOG" | tail -n 250 || true
+        echo "Final build output"
+        tail -n 350 "$LOG" || true
+        echo "Build exit code: $STATUS"
 
-          set +e
-          python3 -u build-system/Make/Make.py \
-            --bazelUserRoot=/private/var/tmp/_bazel_containerhost \
-            build \
-            --configurationPath=build-system/appstore-configuration.json \
-            --codesigningInformationPath=build-system/fake-codesigning \
-            --configuration=release_arm64 \
-            --buildNumber=28 \
-            2>&1 | tee "$LOG"
-          STATUS=${PIPESTATUS[0]}
-          set -e
+        if [ "$STATUS" -ne 0 ]; then
+          exit "$STATUS"
+        fi
 
-          echo ""
-          echo "========== ERROR SUMMARY =========="
-          grep -iE '(^|[[:space:]])(error:|ERROR|FAILED|FAILURE|Traceback|Exception|fatal:)' "$LOG" | tail -n 250 || true
-          echo "========== FINAL 350 LINES =========="
-          tail -n 350 "$LOG" || true
-          echo "========== BUILD EXIT CODE: $STATUS =========="
+        # bazel-bin is a symlink; use the same output path as Make.py.
+        IPA_PATH="bazel-bin/Telegram/Telegram.ipa"
+        if [ ! -f "$IPA_PATH" ]; then
+          echo "ERROR: Make.py succeeded but Telegram.ipa was not found" | tee -a "$LOG"
+          find -L bazel-bin -type f \( -name '*.ipa' -o -name '*.appex' \) 2>/dev/null | tail -n 200 | tee -a "$LOG" || true
+          exit 91
+        fi
+        echo "Found IPA: $IPA_PATH" | tee -a "$LOG"
+        cp "$IPA_PATH" "$RUNNER_TEMP/Telegram-source-built.ipa"
+    - name: Upload full build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: MadGram-build-log
+        path: |
+          ${{ github.workspace }}/MadGram-build.log
+          ${{ runner.temp }}/MadGram-source-provenance.json
+          ${{ runner.temp }}/MadGram-source-changes.patch
+        if-no-files-found: warn
+        retention-days: 7
+    - name: Stop after failed build
+      if: steps.madgram_build.outcome == 'failure'
+      run: |
+        echo "MadGram build failed. Full log was uploaded as artifact MadGram-build-log."
+        exit 1
+    - name: Package the freshly compiled app and NSE for full re-signing
+      run: |
+        python3 - <<'PY'
+        import plistlib, zipfile, hashlib
+        from pathlib import Path
 
-          if [ "$STATUS" -ne 0 ]; then
-            exit "$STATUS"
-          fi
+        src = Path('${{ runner.temp }}/Telegram-source-built.ipa')
+        dst = Path('${{ runner.temp }}/MadGram_1.0.15_NSE_clean_build29_ready_to_sign.ipa')
+        MAIN_ID = 'app.fennel4203.spinach8914'
+        NSE_ID = MAIN_ID + '.NotificationService'
+        VER = '12.9.2'
+        BUILD = '29'
 
-          # bazel-bin is a symlink; use the same output path as Make.py.
-          IPA_PATH="bazel-bin/Telegram/Telegram.ipa"
-          if [ ! -f "$IPA_PATH" ]; then
-            echo "ERROR: Make.py succeeded but Telegram.ipa was not found" | tee -a "$LOG"
-            find -L bazel-bin -type f \( -name '*.ipa' -o -name '*.appex' \) 2>/dev/null | tail -n 200 | tee -a "$LOG" || true
-            exit 91
-          fi
-          echo "Found IPA: $IPA_PATH" | tee -a "$LOG"
-          cp "$IPA_PATH" "$RUNNER_TEMP/Telegram-source-built.ipa"
+        def clone_info(info):
+            out = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+            for attr in ('compress_type','comment','extra','create_system','create_version','extract_version','flag_bits','volume','internal_attr','external_attr'):
+                setattr(out, attr, getattr(info, attr))
+            return out
 
-      - name: Upload full build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: MadGram-build-log
-          path: ${{ github.workspace }}/MadGram-build.log
-          if-no-files-found: warn
-          retention-days: 7
+        with zipfile.ZipFile(src, 'r') as zin:
+            names = zin.namelist()
+            app_infos = [n for n in names if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
+            if len(app_infos) != 1:
+                raise SystemExit(f'expected one app Info.plist: {app_infos}')
+            app_info = app_infos[0]
+            app_prefix = app_info[:-len('Info.plist')]
+            appex_infos = [n for n in names if n.startswith(app_prefix+'PlugIns/') and n.endswith('.appex/Info.plist')]
+            nse_infos = []
+            for n in appex_infos:
+                p = plistlib.loads(zin.read(n))
+                if p.get('NSExtension',{}).get('NSExtensionPointIdentifier') == 'com.apple.usernotifications.service':
+                    nse_infos.append(n)
+            if len(nse_infos) != 1 or len(appex_infos) != 1:
+                raise SystemExit(f'expected only one NSE, appex={appex_infos}, nse={nse_infos}')
+            nse_info = nse_infos[0]
 
-      - name: Stop after failed build
-        if: steps.madgram_build.outcome == 'failure'
-        run: |
-          echo "MadGram build failed. Full log was uploaded as artifact MadGram-build-log."
-          exit 1
+            with zipfile.ZipFile(dst, 'w', allowZip64=True) as zout:
+                for info in zin.infolist():
+                    name = info.filename
+                    if '/_CodeSignature/' in name or name.endswith('/embedded.mobileprovision'):
+                        continue
+                    data = zin.read(name)
+                    if name == app_info:
+                        p = plistlib.loads(data)
+                        old_id = p['CFBundleIdentifier']
+                        p['CFBundleIdentifier'] = MAIN_ID
+                        p['CFBundleShortVersionString'] = VER
+                        p['CFBundleVersion'] = BUILD
+                        p['CFBundleDisplayName'] = 'MadGram'
+                        p['CFBundleName'] = 'MadGram'
+                        p['MinimumOSVersion'] = '13.0'
+                        def rebase_identifier(value):
+                            if value == old_id or value.startswith(old_id + '.'):
+                                return MAIN_ID + value[len(old_id):]
+                            return value
+                        if 'BGTaskSchedulerPermittedIdentifiers' in p:
+                            p['BGTaskSchedulerPermittedIdentifiers'] = [
+                                rebase_identifier(value)
+                                for value in p['BGTaskSchedulerPermittedIdentifiers']
+                            ]
+                        for url_type in p.get('CFBundleURLTypes', []):
+                            if 'CFBundleURLName' in url_type:
+                                url_type['CFBundleURLName'] = rebase_identifier(url_type['CFBundleURLName'])
+                        data = plistlib.dumps(p, fmt=plistlib.FMT_BINARY, sort_keys=False)
+                    elif name == nse_info:
+                        p = plistlib.loads(data)
+                        p['CFBundleIdentifier'] = NSE_ID
+                        p['CFBundleShortVersionString'] = VER
+                        p['CFBundleVersion'] = BUILD
+                        p['CFBundleDisplayName'] = 'MadGram'
+                        p['CFBundleName'] = 'MadGram'
+                        data = plistlib.dumps(p, fmt=plistlib.FMT_BINARY, sort_keys=False)
+                    zout.writestr(clone_info(info), data)
 
-      - name: Convert to clean eSign-ready IPA and verify
-        run: |
-          python3 - <<'PY'
-          import plistlib, zipfile, hashlib
-          from pathlib import Path
+        with zipfile.ZipFile(dst, 'r') as z:
+            names = z.namelist()
+            if any('/_CodeSignature/' in n for n in names): raise SystemExit('stale signature')
+            if any(n.endswith('/embedded.mobileprovision') for n in names): raise SystemExit('stale profile')
+            app_infos = [n for n in names if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
+            app_prefix = app_infos[0][:-len('Info.plist')]
+            main = plistlib.loads(z.read(app_infos[0]))
+            if main['CFBundleIdentifier'] != MAIN_ID: raise SystemExit('main id mismatch')
+            appex_infos = [n for n in names if n.startswith(app_prefix+'PlugIns/') and n.endswith('.appex/Info.plist')]
+            if len(appex_infos) != 1: raise SystemExit(f'appex count {appex_infos}')
+            nse = plistlib.loads(z.read(appex_infos[0]))
+            if nse['CFBundleIdentifier'] != NSE_ID: raise SystemExit('nse id mismatch')
+            if nse['NSExtension']['NSExtensionPointIdentifier'] != 'com.apple.usernotifications.service': raise SystemExit('wrong extension type')
+            exe = appex_infos[0][:-len('Info.plist')] + nse['CFBundleExecutable']
+            if exe not in names: raise SystemExit('NSE executable missing')
 
-          src = Path('${{ runner.temp }}/Telegram-source-built.ipa')
-          dst = Path('${{ runner.temp }}/MadGram_1.0.15_PushSource_ready_to_sign.ipa')
-          MAIN_ID = 'app.fennel4203.spinach8914'
-          NSE_ID = MAIN_ID + '.NotificationService'
-          VER = '12.9.2'
-          BUILD = '28'
+        digest = hashlib.sha256(dst.read_bytes()).hexdigest()
+        Path('${{ runner.temp }}/SHA256.txt').write_text(f'{digest}  {dst.name}\n')
+        print('Packaged fresh build for full re-signing:', dst)
+        print('SHA256', digest)
+        PY
+    - name: Verify NSE, compiled configuration and both dependency graphs
+      run: |
+        python3 - <<'PY'
+        """Read-only checks for a fresh arm64 MadGram build; no binary patching."""
+        import hashlib
+        import json
+        import os
+        import plistlib
+        import posixpath
+        import struct
+        import zipfile
+        from pathlib import Path
 
-          def clone_info(info):
-              out = zipfile.ZipInfo(info.filename, date_time=info.date_time)
-              for attr in ('compress_type','comment','extra','create_system','create_version','extract_version','flag_bits','volume','internal_attr','external_attr'):
-                  setattr(out, attr, getattr(info, attr))
-              return out
 
-          with zipfile.ZipFile(src, 'r') as zin:
-              names = zin.namelist()
-              app_infos = [n for n in names if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
-              if len(app_infos) != 1:
-                  raise SystemExit(f'expected one app Info.plist: {app_infos}')
-              app_info = app_infos[0]
-              app_prefix = app_info[:-len('Info.plist')]
-              appex_infos = [n for n in names if n.startswith(app_prefix+'PlugIns/') and n.endswith('.appex/Info.plist')]
-              nse_infos = []
-              for n in appex_infos:
-                  p = plistlib.loads(zin.read(n))
-                  if p.get('NSExtension',{}).get('NSExtensionPointIdentifier') == 'com.apple.usernotifications.service':
-                      nse_infos.append(n)
-              if len(nse_infos) != 1 or len(appex_infos) != 1:
-                  raise SystemExit(f'expected only one NSE, appex={appex_infos}, nse={nse_infos}')
-              nse_info = nse_infos[0]
+        def require(condition, message):
+            if not condition:
+                raise RuntimeError(message)
 
-              with zipfile.ZipFile(dst, 'w', allowZip64=True) as zout:
-                  for info in zin.infolist():
-                      name = info.filename
-                      if '/_CodeSignature/' in name or name.endswith('/embedded.mobileprovision'):
-                          continue
-                      data = zin.read(name)
-                      if name == app_info:
-                          p = plistlib.loads(data)
-                          p['CFBundleIdentifier'] = MAIN_ID
-                          p['CFBundleShortVersionString'] = VER
-                          p['CFBundleVersion'] = BUILD
-                          data = plistlib.dumps(p, fmt=plistlib.FMT_BINARY, sort_keys=False)
-                      elif name == nse_info:
-                          p = plistlib.loads(data)
-                          p['CFBundleIdentifier'] = NSE_ID
-                          p['CFBundleShortVersionString'] = VER
-                          p['CFBundleVersion'] = BUILD
-                          p['CFBundleDisplayName'] = 'MadGram'
-                          p['CFBundleName'] = 'MadGram'
-                          data = plistlib.dumps(p, fmt=plistlib.FMT_BINARY, sort_keys=False)
-                      zout.writestr(clone_info(info), data)
 
-          with zipfile.ZipFile(dst, 'r') as z:
-              names = z.namelist()
-              if any('/_CodeSignature/' in n for n in names): raise SystemExit('stale signature')
-              if any(n.endswith('/embedded.mobileprovision') for n in names): raise SystemExit('stale profile')
-              app_infos = [n for n in names if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
-              app_prefix = app_infos[0][:-len('Info.plist')]
-              main = plistlib.loads(z.read(app_infos[0]))
-              if main['CFBundleIdentifier'] != MAIN_ID: raise SystemExit('main id mismatch')
-              appex_infos = [n for n in names if n.startswith(app_prefix+'PlugIns/') and n.endswith('.appex/Info.plist')]
-              if len(appex_infos) != 1: raise SystemExit(f'appex count {appex_infos}')
-              nse = plistlib.loads(z.read(appex_infos[0]))
-              if nse['CFBundleIdentifier'] != NSE_ID: raise SystemExit('nse id mismatch')
-              if nse['NSExtension']['NSExtensionPointIdentifier'] != 'com.apple.usernotifications.service': raise SystemExit('wrong extension type')
-              exe = appex_infos[0][:-len('Info.plist')] + nse['CFBundleExecutable']
-              if exe not in names: raise SystemExit('NSE executable missing')
+        class Image:
+            def __init__(self, data):
+                self.data = data
+                require(data[:4] == bytes.fromhex('cffaedfe'), 'Expected a thin little-endian 64-bit Mach-O')
+                require(struct.unpack_from('<I', data, 4)[0] == 0x100000c, 'Expected arm64 device code')
+                count, total = struct.unpack_from('<II', data, 16)
+                self.segments, self.symbols, self.dylibs, self.rpaths = [], {}, [], []
+                self.encrypted = False
+                pos = 32
+                for _ in range(count):
+                    command, length = struct.unpack_from('<II', data, pos)
+                    require(length >= 8 and pos + length <= 32 + total <= len(data), 'Invalid load command')
+                    cmd = command & 0x7fffffff
+                    if cmd == 0x19:
+                        vm, vm_size, file_offset, file_size = struct.unpack_from('<4Q', data, pos + 24)
+                        require(file_offset + file_size <= len(data), 'Segment exceeds executable')
+                        self.segments.append((vm, file_offset, file_size))
+                    elif cmd == 2:
+                        symoff, nsyms, stroff, strsize = struct.unpack_from('<4I', data, pos + 8)
+                        require(symoff + nsyms * 16 <= len(data) and stroff + strsize <= len(data), 'Invalid symbol table')
+                        for i in range(nsyms):
+                            ix, typ, section, desc, value = struct.unpack_from('<IBBHQ', data, symoff + i * 16)
+                            if ix and typ & 0x0e == 0x0e:
+                                name = data[stroff + ix:data.index(b'\0', stroff + ix, stroff + strsize)].decode()
+                                self.symbols[name] = value
+                    elif cmd in (0xc, 0x18, 0x1f, 0x23, 0x1c):
+                        start = pos + struct.unpack_from('<I', data, pos + 8)[0]
+                        value = data[start:data.index(b'\0', start, pos + length)].decode()
+                        if cmd == 0x1c:
+                            self.rpaths.append(value)
+                        else:
+                            self.dylibs.append((value, cmd == 0x18))
+                    elif cmd in (0x21, 0x2c):
+                        self.encrypted |= struct.unpack_from('<I', data, pos + 16)[0] != 0
+                    elif cmd == 0x32:
+                        require(struct.unpack_from('<I', data, pos + 8)[0] == 2, 'Expected iOS device platform')
+                    pos += length
+                require(pos == 32 + total, 'Load command size mismatch')
+                require(not self.encrypted, 'Executable is encrypted')
 
-          digest = hashlib.sha256(dst.read_bytes()).hexdigest()
-          Path('${{ runner.temp }}/SHA256.txt').write_text(f'{digest}  {dst.name}\n')
-          print('READY', dst)
-          print('SHA256', digest)
-          PY
+            def offset(self, address):
+                for vm, start, size in self.segments:
+                    if vm <= address < vm + size:
+                        return start + address - vm
+                raise RuntimeError('Address is not file-backed')
 
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: MadGram-1.0.15-PushSource-ready-to-sign
-          path: |
-            ${{ runner.temp }}/MadGram_1.0.15_PushSource_ready_to_sign.ipa
-            ${{ runner.temp }}/SHA256.txt
-          if-no-files-found: error
-          retention-days: 7
+            def u64(self, address):
+                return struct.unpack_from('<Q', self.data, self.offset(address))[0]
+
+            def string(self, address):
+                start = self.offset(address)
+                return self.data[start:self.data.index(b'\0', start)].decode()
+
+            def methods(self, class_name):
+                cls = self.symbols['_OBJC_CLASS_$_' + class_name]
+                ro = self.u64(cls + 32) & ~7
+                require(self.string(self.u64(ro + 24)) == class_name, 'Objective-C class mismatch')
+                ml = self.u64(ro + 32)
+                pos = self.offset(ml)
+                flags, count = struct.unpack_from('<II', self.data, pos)
+                size = flags & 0xffff
+                result = {}
+                for i in range(count):
+                    entry = pos + 8 + i * size
+                    va = ml + 8 + i * size
+                    if flags & 0x80000000:
+                        name_offset, types_offset, imp_offset = struct.unpack_from('<iii', self.data, entry)
+                        name_address = va + name_offset
+                        if not flags & 0x40000000:
+                            name_address = self.u64(name_address)
+                        implementation = va + 8 + imp_offset
+                    else:
+                        name_address, types_address, implementation = struct.unpack_from('<3Q', self.data, entry)
+                    result[self.string(name_address)] = self.offset(implementation)
+                return result
+
+
+        def audit(src, dst, config_path, provenance_path, report_path):
+            config = json.loads(config_path.read_text())
+            report = json.loads(provenance_path.read_text())
+            require(config['enable_icloud'] is False, 'CloudKit must remain disabled')
+            require(config['is_appstore_build'] == 'false' and config['appstore_id'] == '0', 'Wrong App Store configuration')
+            require(config['api_id'] == '31349372', 'Wrong MadGram API ID')
+            require(hashlib.sha256(config['api_hash'].encode()).hexdigest() == 'd17839d0c28e1921d5f38825b1c3e046ce7d1a7b8e5340e1d3e0e9df8bfdc77e', 'Wrong MadGram API hash')
+            with zipfile.ZipFile(src) as original, zipfile.ZipFile(dst) as package:
+                require(original.testzip() is None and package.testzip() is None, 'ZIP CRC failure')
+                entries = package.infolist()
+                names = package.namelist()
+                require(len(names) == len(set(names)), 'Duplicate ZIP members')
+                require(all(not n.startswith('/') and '..' not in n.split('/') for n in names), 'Unsafe archive path')
+                require(not any('/_CodeSignature/' in n or n.endswith('/embedded.mobileprovision') for n in names), 'Stale build signing resources')
+                plists = {n: plistlib.loads(package.read(n)) for n in names if n.endswith('.plist')}
+                mains = [n for n in names if n.startswith('Payload/') and n.count('/') == 2 and n.endswith('.app/Info.plist')]
+                require(len(mains) == 1, 'Expected one main application')
+                main_path = mains[0]
+                app_prefix = main_path[:-len('Info.plist')]
+                extensions = [n for n in names if n.startswith(app_prefix + 'PlugIns/') and n.endswith('.appex/Info.plist')]
+                require(len(extensions) == 1, 'Expected only one NSE')
+                nse_path = extensions[0]
+                main, nse = plists[main_path], plists[nse_path]
+                require(main['CFBundleIdentifier'] == 'app.fennel4203.spinach8914', 'Wrong main Bundle ID')
+                require(nse['CFBundleIdentifier'] == main['CFBundleIdentifier'] + '.NotificationService', 'Wrong NSE Bundle ID')
+                require(nse['NSExtension']['NSExtensionPointIdentifier'] == 'com.apple.usernotifications.service', 'Wrong extension point')
+                require(bool(nse['NSExtension'].get('NSExtensionPrincipalClass')), 'NSE principal class is missing')
+                require(main['CFBundleVersion'] == nse['CFBundleVersion'] == '29', 'Build numbers must match')
+                require(main['CFBundleShortVersionString'] == nse['CFBundleShortVersionString'] == '12.9.2', 'Version mismatch')
+                require(main['MinimumOSVersion'] == nse['MinimumOSVersion'], 'Deployment targets must match')
+                main_exe = app_prefix + main['CFBundleExecutable']
+                nse_exe = nse_path[:-len('Info.plist')] + nse['CFBundleExecutable']
+                images, hashes = {}, {}
+                for info in entries:
+                    if info.is_dir():
+                        continue
+                    with package.open(info) as stream:
+                        magic = stream.read(4)
+                    if magic in (bytes.fromhex('cffaedfe'), bytes.fromhex('cafebabe'), bytes.fromhex('bebafeca'), bytes.fromhex('feedfacf')):
+                        data = package.read(info)
+                        images[info.filename] = Image(data)
+                        require(data == original.read(info.filename), 'Binary changed during packaging: ' + info.filename)
+                        hashes[info.filename] = hashlib.sha256(data).hexdigest()
+                require(main_exe in images and nse_exe in images, 'Main or NSE executable missing')
+                framework = app_prefix + 'Frameworks/TelegramUIFramework.framework/TelegramUIFramework'
+                require(framework in images, 'TelegramUIFramework missing')
+                require(config['api_hash'].encode() + b'\0' in images[framework].data, 'Release API hash missing from compiled code')
+                group = b'group.a69e6dc9a612eb7d.1'
+                require(group in images[framework].data and group in images[nse_exe].data, 'Shared App Group missing from main or NSE code')
+                build_config = images[framework]
+                methods = build_config.methods('BuildConfig')
+                for getter in ('isICloudEnabled', 'isAppStoreBuild', 'appStoreId'):
+                    instruction, ret = struct.unpack_from('<II', build_config.data, methods[getter])
+                    require(instruction in (0x52800000, 0xd2800000, 0x2a1f03e0, 0xaa1f03e0) and ret == 0xd65f03c0, 'Getter does not return zero: ' + getter)
+                weak_missing, visited = [], set()
+
+                def expand(path, loader, executable):
+                    path = path.replace('@loader_path', posixpath.dirname(loader))
+                    path = path.replace('@executable_path', posixpath.dirname(executable))
+                    return posixpath.normpath(path)
+
+                def is_system(path):
+                    return path.startswith('/usr/lib/') or path.startswith('/System/Library/')
+
+                def visit(path, executable, inherited):
+                    if (path, executable) in visited:
+                        return
+                    visited.add((path, executable))
+                    image = images[path]
+                    rpaths = [expand(p, path, executable) for p in image.rpaths] + inherited
+                    for dependency, weak in image.dylibs:
+                        if dependency.startswith('@rpath/'):
+                            candidates = [posixpath.normpath(p + '/' + dependency[len('@rpath/'):]) for p in rpaths]
+                        else:
+                            candidates = [expand(dependency, path, executable)]
+                        resolved = next((p for p in candidates if p in images or is_system(p)), None)
+                        if resolved is None and weak:
+                            weak_missing.append({'image': path, 'dependency': dependency})
+                        else:
+                            require(resolved is not None, 'Unresolved dependency: ' + path + ' -> ' + dependency)
+                            if resolved in images:
+                                visit(resolved, executable, rpaths)
+
+                visit(main_exe, main_exe, [])
+                visit(nse_exe, nse_exe, [])
+                report.update({
+                    'ipa_sha256': hashlib.sha256(dst.read_bytes()).hexdigest(),
+                    'zip_crc_passed': True,
+                    'plist_count': len(plists),
+                    'mach_o_count': len(images),
+                    'mach_o_sha256': hashes,
+                    'binary_bytes_unchanged_after_compilation': True,
+                    'notification_service_extension_included': True,
+                    'strong_dylib_dependencies_resolved': True,
+                    'weak_optional_dependencies_not_packaged': weak_missing,
+                    'cloudkit_disabled_in_compiled_code': True,
+                    'non_app_store_build_verified_in_compiled_code': True,
+                    'release_api_hash_present_in_compiled_code': True,
+                    'requires_full_resign': True,
+                    'main_bundle_id': main['CFBundleIdentifier'],
+                    'nse_bundle_id': nse['CFBundleIdentifier'],
+                    'device_launch_tested': False,
+                    'device_login_tested': False,
+                    'APNs_delivery_tested': False,
+                })
+            report_path.write_text(json.dumps(report, indent=2) + '\n')
+            print('Archive, NSE, compiled configuration and dependency checks passed')
+
+
+        if __name__ == '__main__':
+            root = Path('/Users/Shared/telegram-ios')
+            out = Path(os.environ['RUNNER_TEMP'])
+            audit(out / 'Telegram-source-built.ipa', out / 'MadGram_1.0.15_NSE_clean_build29_ready_to_sign.ipa',
+                  root / 'build-system/local-development-configuration.json', out / 'MadGram-source-provenance.json',
+                  out / 'MadGram-verification.json')
+        PY
+    - name: Upload IPA
+      uses: actions/upload-artifact@v4
+      with:
+        name: MadGram-1.0.15-NSE-clean-build29-ready-to-sign
+        path: |
+          ${{ runner.temp }}/MadGram_1.0.15_NSE_clean_build29_ready_to_sign.ipa
+          ${{ runner.temp }}/SHA256.txt
+          ${{ runner.temp }}/MadGram-verification.json
+          ${{ runner.temp }}/MadGram-source-provenance.json
+          ${{ runner.temp }}/MadGram-source-changes.patch
+        if-no-files-found: error
+        retention-days: 7
+'on':
+  workflow_dispatch: null
+  push:
+    branches:
+    - main
+concurrency:
+  group: madgram-clean-source
+  cancel-in-progress: false
