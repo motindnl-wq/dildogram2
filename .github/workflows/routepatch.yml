@@ -1,0 +1,63 @@
+name: RoutePatch iPhone IPA
+on:
+  push:
+    paths: ['.github/workflows/routepatch.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: NodePassProject/Anywhere
+          ref: 89905e0e3641bcbd958a66fcb6f027a2bdecec90
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Apply compatibility fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('Shared/Networking/Protocols/VLESS/Reality/RealityConfiguration.swift')
+          s=p.read_text()
+          marker='nonisolated enum TLSFingerprint: String, Codable, CaseIterable {'
+          method='\n    static func imported(_ raw: String) -> TLSFingerprint? {\n        let v = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()\n        if let e = TLSFingerprint(rawValue: v) { return e }\n        switch v {\n        case "chrome": return .chrome133\n        case "firefox": return .firefox148\n        case "safari", "ios": return .safari26\n        case "edge": return .edge106\n        default: return nil\n        }\n    }\n'
+          assert marker in s
+          p.write_text(s.replace(marker,marker+method))
+          for p in Path('Shared').rglob('*.swift'):
+              s=p.read_text().replace('TLSFingerprint(rawValue: $0)','TLSFingerprint.imported($0)').replace('TLSFingerprint(rawValue: raw) ?? .default','TLSFingerprint.imported(raw) ?? .default')
+              p.write_text(s)
+          p=Path('Shared/AWCore.swift')
+          s=p.read_text().replace('static let appGroupSuite = "group.\\(bundle)"','static let appGroupSuite = "group.a69e6dc9a612eb7d.1"')
+          p.write_text(s)
+          PY
+      - name: Build iPhone app
+        run: |
+          set -o pipefail
+          xcodebuild -project Anywhere.xcodeproj -scheme Anywhere -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/dd CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build 2>&1 | tee build.log
+      - name: Package IPA and corresponding source
+        run: |
+          set -euo pipefail
+          APP="$PWD/build/dd/Build/Products/Release-iphoneos/Anywhere.app"
+          test -f "$APP/Info.plist"
+          mkdir -p output/Payload
+          ditto "$APP" output/Payload/RoutePatch.app
+          /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName RoutePatch' output/Payload/RoutePatch.app/Info.plist
+          cp -R output/Payload source-payload-check
+          (cd output && zip -qry RoutePatch-unsigned.ipa Payload)
+          git diff > output/compatibility.patch
+          git archive HEAD | gzip > output/upstream-source.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoutePatch-IPA-source
+          path: output/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: RoutePatch-log
+          path: build.log
+
