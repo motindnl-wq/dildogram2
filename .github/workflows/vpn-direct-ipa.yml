@@ -1,0 +1,66 @@
+name: Build VPN Direct IPA
+on:
+  push:
+    paths: ['.github/workflows/vpn-direct-ipa.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: TT450/vpn-direct-app
+          ref: 82ca1db423ff096996935ceb239cf72e695d6ad8
+          submodules: recursive
+          fetch-depth: 0
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+          cache-dependency-path: core/sing-box/go.sum
+      - name: Build VPN core
+        env:
+          VPN_DIRECT_APPLE_PLATFORM: ios
+          VPN_DIRECT_FORCE_GOMOBILE_INSTALL: '1'
+        run: bash scripts/build_libbox.sh
+      - name: Build iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -project sing-box.xcodeproj -scheme SFI -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData-ipa -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build 2>&1 | tee build-ipa.log
+      - name: Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRODUCTS="$PWD/build/DerivedData-ipa/Build/Products/Release-iphoneos"
+          APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$APP"
+          EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
+          lipo -verify_arch arm64 "$APP/$EXECUTABLE"
+          find "$APP/PlugIns" -name '*.appex' | grep -q .
+          mkdir -p output/Payload
+          ditto "$APP" "output/Payload/$(basename "$APP")"
+          cd output
+          zip -qry VPN-Direct-unsigned.ipa Payload
+          unzip -t VPN-Direct-unsigned.ipa
+          shasum -a 256 VPN-Direct-unsigned.ipa > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VPN-Direct-unsigned-IPA
+          path: |
+            output/VPN-Direct-unsigned.ipa
+            output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VPN-Direct-build-log
+          path: build-ipa.log
+          if-no-files-found: ignore
