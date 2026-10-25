@@ -48,7 +48,7 @@ jobs:
           s = p.read_text()
           old = '$(SRCROOT)/build/force_load/ApplicationLibrary'
           assert s.count(old) == 2
-          s = s.replace(old, '$(BUILT_PRODUCTS_DIR)/ApplicationLibrary.framework/ApplicationLibrary')
+          s = s.replace('"-Wl,-force_load,' + old + '",', '')
           phase = '\t\t\t\tB7E1A9012F6B4C0D0089D001 /* Wait for ApplicationLibrary */,\n'
           assert s.count(phase) == 1
           s = s.replace(phase, '')
