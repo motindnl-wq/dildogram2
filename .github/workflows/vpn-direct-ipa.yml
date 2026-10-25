@@ -54,11 +54,22 @@ jobs:
           s = s.replace(phase, '')
           p.write_text(s)
           PY
+      - uses: actions/cache/restore@v4
+        id: app-cache
+        with:
+          path: build/DerivedData-ipa/Build/Products
+          key: vpndirect-app-82ca1db-linkfix-v1
       - name: Build iPhone app
+        if: steps.app-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           xcodebuild -project sing-box.xcodeproj -scheme SFI -configuration Release -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData-ipa -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build 2>&1 | tee build-ipa.log
+      - uses: actions/cache/save@v4
+        if: steps.app-cache.outputs.cache-hit != 'true'
+        with:
+          path: build/DerivedData-ipa/Build/Products
+          key: vpndirect-app-82ca1db-linkfix-v1
       - name: Package IPA
         shell: bash
         run: |
@@ -67,7 +78,7 @@ jobs:
           APP="$(find "$PRODUCTS" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$APP"
           EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")
-          lipo -verify_arch arm64 "$APP/$EXECUTABLE"
+          lipo "$APP/$EXECUTABLE" -verify_arch arm64
           find "$APP/PlugIns" -name '*.appex' | grep -q .
           mkdir -p output/Payload
           ditto "$APP" "output/Payload/$(basename "$APP")"
