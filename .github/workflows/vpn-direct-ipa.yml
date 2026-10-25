@@ -24,11 +24,36 @@ jobs:
         with:
           go-version: '1.26.6'
           cache-dependency-path: core/sing-box/go.sum
+      - uses: actions/cache/restore@v4
+        id: core-cache
+        with:
+          path: Libbox.xcframework
+          key: vpndirect-libbox-82ca1db-ios-xcode16-v1
       - name: Build VPN core
+        if: steps.core-cache.outputs.cache-hit != 'true'
         env:
           VPN_DIRECT_APPLE_PLATFORM: ios
           VPN_DIRECT_FORCE_GOMOBILE_INSTALL: '1'
         run: bash scripts/build_libbox.sh
+      - uses: actions/cache/save@v4
+        if: steps.core-cache.outputs.cache-hit != 'true'
+        with:
+          path: Libbox.xcframework
+          key: vpndirect-libbox-82ca1db-ios-xcode16-v1
+      - name: Fix clean-build static library linkage
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('sing-box.xcodeproj/project.pbxproj')
+          s = p.read_text()
+          old = '$(SRCROOT)/build/force_load/ApplicationLibrary'
+          assert s.count(old) == 2
+          s = s.replace(old, '$(BUILT_PRODUCTS_DIR)/ApplicationLibrary.framework/ApplicationLibrary')
+          phase = '\t\t\t\tB7E1A9012F6B4C0D0089D001 /* Wait for ApplicationLibrary */,\n'
+          assert s.count(phase) == 1
+          s = s.replace(phase, '')
+          p.write_text(s)
+          PY
       - name: Build iPhone app
         shell: bash
         run: |
